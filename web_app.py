@@ -173,8 +173,6 @@ def home_page():
 
     st.button("Add Student", key="nav-add", use_container_width=True, on_click=lambda: navigate("add"))
     st.button("Take Attendance", key="nav-attendance", use_container_width=True, on_click=lambda: navigate("attendance"))
-    st.button("Delete Student", key="nav-delete", use_container_width=True, on_click=lambda: navigate("delete"))
-    st.button("List Students", key="nav-list", use_container_width=True, on_click=lambda: navigate("list"))
     st.button("Set Threshold", key="nav-threshold", use_container_width=True, on_click=lambda: navigate("threshold"))
 
 
@@ -201,7 +199,6 @@ def add_student_page():
             st.session_state.add_saved = False
 
     if st.session_state.get("add_started"):
-        st.info("Position your face in the camera. It will auto-capture when detected. Click Stop to end.")
 
         class AddStudentProcessor(VideoProcessorBase):
             def __init__(self):
@@ -210,86 +207,179 @@ def add_student_page():
                 self.captured = False
                 self.capture_attempts = 0
                 self.max_attempts = 50
+                self.error_count = 0
+                self.last_successful_frame = None
+                self.face_detected = False
+                self.captured_bbox = None
+                self.face_data = None
 
             def recv(self, frame):
-                img = frame.to_ndarray(format="bgr24")
-                faces = self.system.detect_faces(img)
+                try:
+                    # Try to convert frame to numpy array with better error handling
+                    try:
+                        img = frame.to_ndarray(format="bgr24")
+                        if img is None or img.size == 0:
+                            raise ValueError("Empty frame received")
+                    except Exception as frame_error:
+                        self.error_count += 1
+                        print(f"AddStudent frame conversion error #{self.error_count}: {frame_error}")
+                        # If we have a last successful frame, use it
+                        if self.last_successful_frame is not None and self.error_count < 3:
+                            return self.last_successful_frame
+                        # Create error frame
+                        error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2 = __import__("cv2")
+                        cv2.putText(error_img, f"Frame Error ({self.error_count})", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        return av.VideoFrame.from_ndarray(error_img, format="bgr24")
 
-                # Overlay guidance
-                cv2 = __import__("cv2")
-                cv2.putText(
-                    img,
-                    f"Looking for face... ({self.capture_attempts}/{self.max_attempts})",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    img,
-                    "Position your face in the camera",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2,
-                )
+                    cv2 = __import__("cv2")
 
-                if not self.captured and self.capture_attempts < self.max_attempts:
-                    for face in faces:
-                        bbox = face.get("bbox")
-                        if bbox is None:
-                            continue
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
-                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                    # Reset error count on successful frame processing
+                    if self.error_count > 0:
+                        self.error_count = max(0, self.error_count - 1)
+
+                    # Detect faces with error handling
+                    faces = []
+                    try:
+                        faces = self.system.detect_faces(img)
+                    except Exception as e:
+                        print(f"Face detection error in AddStudent: {e}")
+                        faces = []
+
+                    # Update face detection status (without session state to avoid warnings)
+                    current_face_detected = bool(faces) and not self.captured
+                    self.face_detected = current_face_detected
+
+                    # Display information on camera (without name)
+                    student_id = st.session_state.get("add_student_id", "")
+
+                    # Main instruction
+                    if self.face_detected:
                         cv2.putText(
                             img,
-                            "Detecting...",
-                            (x1, max(0, y1 - 10)),
+                            "Face detected! Click Submit to save.",
+                            (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (255, 255, 0),
+                            0.7,
+                            (0, 255, 0),
+                            2,
+                        )
+                    else:
+                        cv2.putText(
+                            img,
+                            "Position your face in the camera",
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
                             2,
                         )
 
-                        embedding = face.get("embedding")
-                        if embedding is None:
-                            face_img = img[y1:y2, x1:x2]
-                            if face_img.size > 0:
-                                embedding = self.system.extract_embedding(face_img)
-
-                        if embedding is not None:
-                            self.embedding = (
-                                embedding if isinstance(embedding, np.ndarray) else np.array(embedding)
-                            )
-                            self.captured = True
-                            break
-
-                    self.capture_attempts += 1
-                elif not faces:
+                    # Student ID only
                     cv2.putText(
                         img,
-                        "No face detected",
+                        f"Student ID: {student_id}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    # Status information
+                    cv2.putText(
+                        img,
+                        f"Faces Detected: {len(faces)}",
                         (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
-                        (0, 0, 255),
+                        (0, 255, 255),
                         2,
                     )
 
-                if self.captured:
+                    # Instructions
                     cv2.putText(
                         img,
-                        "Face captured! Saving...",
+                        "Click Submit button when ready",
                         (10, 120),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
+                        0.6,
+                        (255, 255, 0),
                         2,
                     )
 
-                return av.VideoFrame.from_ndarray(img, format="bgr24")
+                    # Draw face boxes and handle face detection
+                    for face in faces:
+                        try:
+                            bbox = face.get("bbox")
+                            if bbox is None:
+                                continue
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+
+                            # Draw face box
+                            if self.face_detected:
+                                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for detected
+                                cv2.putText(
+                                    img,
+                                    "Face Ready",
+                                    (x1, max(0, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (0, 255, 0),
+                                    2,
+                                )
+                            else:
+                                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 0), 2)  # Yellow for detecting
+                                cv2.putText(
+                                    img,
+                                    "Detecting...",
+                                    (x1, max(0, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (255, 255, 0),
+                                    2,
+                                )
+
+                            # Always store face data when detected
+                            if self.face_detected:
+                                embedding = face.get("embedding")
+                                if embedding is None:
+                                    face_img = img[y1:y2, x1:x2]
+                                    if face_img.size > 0:
+                                        try:
+                                            embedding = self.system.extract_embedding(face_img)
+                                        except Exception as e:
+                                            print(f"Embedding extraction error in AddStudent: {e}")
+                                            embedding = None
+
+                                # Store the face data in processor (avoid session state in video processor)
+                                if embedding is not None:
+                                    self.face_data = {
+                                        'embedding': embedding.tolist() if isinstance(embedding, np.ndarray) else embedding,
+                                        'bbox': bbox
+                                    }
+
+                        except Exception as face_error:
+                            print(f"Face processing error in AddStudent: {face_error}")
+                            continue
+
+                    # Store successful frame for fallback
+                    result_frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+                    self.last_successful_frame = result_frame
+                    return result_frame
+
+                except Exception as e:
+                    self.error_count += 1
+                    print(f"AddStudent processing error #{self.error_count}: {e}")
+
+                    # Return last successful frame or simple error frame
+                    if self.last_successful_frame is not None:
+                        return self.last_successful_frame
+                    else:
+                        error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2 = __import__("cv2")
+                        cv2.putText(error_img, f"Processing Error ({self.error_count})", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        return av.VideoFrame.from_ndarray(error_img, format="bgr24")
 
         ctx = webrtc_streamer(
             key="add-student",
@@ -299,42 +389,109 @@ def add_student_page():
             video_processor_factory=AddStudentProcessor,
         )
 
+        # Create placeholders for dynamic content
+        button_placeholder = st.empty()
+        status_placeholder = st.empty()
+        
+        # Function to render buttons based on current state
+        def render_buttons():
+            with button_placeholder.container():
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    # Submit button - always show when camera is running
+                    if not st.session_state.get("add_saved", False):
+                        if st.button("💾 Submit Student", key="add-submit", type="primary", use_container_width=True):
+                            # Get the latest face data from processor if available
+                            face_data = None
+                            if ctx.video_processor and hasattr(ctx.video_processor, 'face_data'):
+                                face_data = ctx.video_processor.face_data
+
+                            sid = st.session_state.add_student_id
+                            name = st.session_state.add_student_name
+
+                            # Final validation before save
+                            if not sid or not name:
+                                st.error("Student ID and Name are required.")
+                            elif sid in system.students:
+                                st.error("Student already exists.")
+                            elif face_data is None:
+                                st.error("No face data captured. Please ensure your face is visible in the camera.")
+                            else:
+                                # Use face data from processor
+                                embedding = face_data['embedding']
+
+                                system.students[sid] = {
+                                    "name": name,
+                                    "registration_date": datetime.now().isoformat(),
+                                }
+                                embedding_entry = {
+                                    "vector": embedding,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "confidence": 1.0,
+                                    "uniqueness": 1.0,
+                                }
+                                system.embeddings[sid] = {
+                                    "name": name,
+                                    "embeddings": [embedding_entry],
+                                    "embedding": embedding,
+                                    "registration_date": datetime.now().isoformat(),
+                                    "diversity_score": 1 / system.max_embeddings,
+                                }
+                                system.save_data()
+                                st.session_state.add_saved = True
+                                st.success(f"✅ Student {name} registered successfully!")
+                                st.rerun()
+                
+                # Removed 'Add Another' button per request to avoid duplicate keys and simplify UI
+        
+        # Function to render status messages
+        def render_status():
+            with status_placeholder.container():
+                if st.session_state.get("add_saved", False):
+                    st.success(f"🎉 Student {st.session_state.add_student_name} registered successfully!")
+                elif ctx.video_processor and hasattr(ctx.video_processor, 'face_detected') and ctx.video_processor.face_detected:
+                    st.info("👤 Face detected! Click Submit to save the student.")
+                else:
+                    st.info("📷 Position your face in the camera. Click Submit when ready.")
+        
+        # Initial render
+        render_status()
+        render_buttons()
+        
+        # Real-time update mechanism using a controlled approach
         if ctx.video_processor and ctx.state.playing:
-            proc = ctx.video_processor
-            if proc.embedding is not None and not st.session_state.get("add_saved", False):
-                # Store captured embedding in session and ask user to Submit
-                st.session_state.add_captured_embedding = proc.embedding.tolist()
-                st.success("Face captured. Click Submit to save.")
-                if st.button("Submit", key="add-submit", type="primary"):
-                    sid = st.session_state.add_student_id
-                    name = st.session_state.add_student_name
-                    # Final validation before save
-                    if not sid or not name:
-                        st.error("Student ID and Name are required.")
-                    elif sid in system.students:
-                        st.error("Student already exists.")
-                    else:
-                        system.students[sid] = {
-                            "name": name,
-                            "registration_date": datetime.now().isoformat(),
-                        }
-                        embedding_entry = {
-                            "vector": st.session_state.add_captured_embedding,
-                            "timestamp": datetime.now().isoformat(),
-                            "confidence": 1.0,
-                            "uniqueness": 1.0,
-                        }
-                        system.embeddings[sid] = {
-                            "name": name,
-                            "embeddings": [embedding_entry],
-                            "embedding": st.session_state.add_captured_embedding,
-                            "registration_date": datetime.now().isoformat(),
-                            "diversity_score": 1 / system.max_embeddings,
-                        }
-                        system.save_data()
-                        st.session_state.add_saved = True
-                        st.success(f"Student {name} registered successfully!")
-                        st.button("\u2190 Back", key="back-add-done", on_click=lambda: navigate("home"))
+            # Check if we need to update the UI based on state changes
+            processor_face_detected = hasattr(ctx.video_processor, 'face_detected') and ctx.video_processor.face_detected
+            current_state = {
+                'face_detected': processor_face_detected,
+                'saved': st.session_state.get("add_saved", False)
+            }
+            
+            # Store previous state for comparison
+            if "add_previous_state" not in st.session_state:
+                st.session_state.add_previous_state = current_state
+            
+            # If state has changed, update the UI
+            if st.session_state.add_previous_state != current_state:
+                st.session_state.add_previous_state = current_state
+                render_status()
+                render_buttons()
+
+        # Back to home button when saved
+        if st.session_state.get("add_saved", False):
+            if st.button("← Back to Home", key="back-add-done", use_container_width=True):
+                # Clean up session state
+                st.session_state.add_started = False
+                st.session_state.add_captured = False
+                st.session_state.add_face_detected = False
+                st.session_state.add_saved = False
+                if "add_face_data" in st.session_state:
+                    del st.session_state.add_face_data
+                if "add_captured_embedding" in st.session_state:
+                    del st.session_state.add_captured_embedding
+                navigate("home")
+                st.rerun()
 
 
 def attendance_page():
@@ -343,7 +500,15 @@ def attendance_page():
     ensure_backend()
     system = st.session_state.system
 
-    st.info("Camera running... Click Stop to end.")
+    # Display system status
+    st.info(f"Camera running... Click Stop to end. Students registered: {len(system.students)}")
+    
+    # Debug information
+    if len(system.students) == 0:
+        st.warning("⚠️ No students registered! Please add students first.")
+    else:
+        st.success(f"✅ {len(system.students)} students ready for recognition")
+        st.caption(f"Recognition threshold: {system.recognition_threshold:.2f}")
 
     class AttendanceProcessor(VideoProcessorBase):
         def __init__(self):
@@ -353,106 +518,219 @@ def attendance_page():
             self.start_time = time.time()
             self.camera_start_time = self.start_time
             self.last_recognition_time = 0.0
-            self.recognition_interval = 0.3
+            self.recognition_interval = 0.8  # Increased to reduce processing load and improve smoothness
             self.last_embedding_update = {}
             self.notification_text = ""
             self.notification_color = (255, 255, 255)
             self.notification_end_time = 0.0
+            self.error_count = 0
+            self.max_errors = 5  # Reduced max errors for faster recovery
+            self.consecutive_errors = 0
+            self.last_successful_frame = None
+            self.frame_skip_count = 0
+            self.max_frame_skip = 3  # Skip processing every 3rd frame for better performance
 
         def recv(self, frame):
-            img = frame.to_ndarray(format="bgr24")
-            cv2 = __import__("cv2")
-
-            ret_img = img
-            self.frame_count += 1
-            current_time = time.time()
-            faces = self.system.detect_faces(img)
-
-            if current_time - self.last_recognition_time >= self.recognition_interval:
-                for face in faces:
-                    bbox = face.get("bbox")
-                    if bbox is None:
-                        continue
-                    x1, y1, x2, y2 = [int(v) for v in bbox]
-
-                    face_embedding = face.get("embedding")
-                    if face_embedding is None:
-                        face_img = img[y1:y2, x1:x2]
-                        if face_img.size > 0:
-                            face_embedding = self.system.extract_embedding(face_img)
-
-                    student_id, confidence = self.system.recognize_face(face_embedding)
-
-                    if student_id and confidence >= self.system.recognition_threshold:
-                        name = self.system.students[student_id]["name"]
-                        if student_id not in self.recognized_student_ids:
-                            recognition_time = current_time - self.camera_start_time
-                            # Console output mirrors main.py
-                            print(f"{name:<40}{confidence*100:.2f}%{recognition_time:.2f} seconds")
-
-                        self.recognized_student_ids.add(student_id)
-                        self.system.log_attendance(student_id, name)
-                        self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
-                    elif student_id and 0.5 <= confidence < 0.7:
-                        name = self.system.students[student_id]["name"]
-                        can_update = True
-                        if student_id in self.last_embedding_update:
-                            if current_time - self.last_embedding_update[student_id] < self.system.min_embedding_update_interval:
-                                can_update = False
-
-                        if can_update and face_embedding is not None:
-                            if self.system.update_student_embedding(student_id, face_embedding, confidence):
-                                self.notification_text = f"New appearance learned for {name}!"
-                                self.notification_color = (0, 255, 0)
-                                self.notification_end_time = current_time + 3
-                                self.last_embedding_update[student_id] = current_time
-
-                            if student_id not in self.recognized_student_ids:
-                                print(f"{'AUTO-CONFIRMED:':<40}{confidence*100:.2f}%{current_time - self.camera_start_time:.2f} seconds")
-
-                            self.recognized_student_ids.add(student_id)
-                            self.system.log_attendance(student_id, name)
-
-                        self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
+            try:
+                # Skip some frames for better performance
+                self.frame_skip_count += 1
+                if self.frame_skip_count % self.max_frame_skip != 0:
+                    # Return the last successful frame or a simple frame
+                    if self.last_successful_frame is not None:
+                        return self.last_successful_frame
                     else:
-                        self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), "Unknown", confidence, False)
+                        # Create a simple placeholder frame
+                        placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2 = __import__("cv2")
+                        cv2.putText(placeholder, "Initializing...", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                        return av.VideoFrame.from_ndarray(placeholder, format="bgr24")
 
-                self.last_recognition_time = current_time
-            else:
-                for face in faces:
-                    bbox = face.get("bbox")
-                    if bbox is None:
-                        continue
-                    x1, y1, x2, y2 = [int(v) for v in bbox]
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
-                    cv2.putText(img, "Tracking...", (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                # Try to convert frame to numpy array with better error handling
+                try:
+                    img = frame.to_ndarray(format="bgr24")
+                    if img is None or img.size == 0:
+                        raise ValueError("Empty frame received")
+                except Exception as frame_error:
+                    self.consecutive_errors += 1
+                    print(f"Frame conversion error #{self.consecutive_errors}: {frame_error}")
+                    
+                    # If we have a last successful frame, use it
+                    if self.last_successful_frame is not None and self.consecutive_errors < 3:
+                        return self.last_successful_frame
+                    
+                    # Create error frame
+                    error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2 = __import__("cv2")
+                    cv2.putText(error_img, f"Frame Error ({self.consecutive_errors})", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    return av.VideoFrame.from_ndarray(error_img, format="bgr24")
 
-            fps = self.frame_count / max(1e-6, (current_time - self.start_time))
-            cv2.putText(img, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(img, f"Faces Detected: {len(faces)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(img, f"Recognized: {len(self.recognized_student_ids)}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.putText(img, "Auto-Learning Active", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2 = __import__("cv2")
+                self.frame_count += 1
+                current_time = time.time()
+                
+                # Reset consecutive errors on successful frame processing
+                self.consecutive_errors = 0
+                
+                # Face detection with error handling
+                faces = []
+                try:
+                    faces = self.system.detect_faces(img)
+                    
+                    # Reset error count on successful processing
+                    if self.error_count > 0:
+                        self.error_count = max(0, self.error_count - 1)
+                        
+                except Exception as e:
+                    print(f"Face detection error: {e}")
+                    faces = []
 
-            if current_time < self.notification_end_time and self.notification_text:
-                (text_width, text_height), _ = cv2.getTextSize(self.notification_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-                cv2.rectangle(
-                    img,
-                    (img.shape[1] // 2 - text_width // 2 - 10, img.shape[0] - 80),
-                    (img.shape[1] // 2 + text_width // 2 + 10, img.shape[0] - 40),
-                    (0, 0, 0),
-                    -1,
-                )
-                cv2.putText(
-                    img,
-                    self.notification_text,
-                    (img.shape[1] // 2 - text_width // 2, img.shape[0] - 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    self.notification_color,
-                    2,
-                )
+                # Process recognition at intervals for better performance
+                if current_time - self.last_recognition_time >= self.recognition_interval:
+                    for face in faces:
+                        try:
+                            bbox = face.get("bbox")
+                            if bbox is None:
+                                continue
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
 
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
+                            # Ensure we have a valid face region
+                            if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0:
+                                continue
+
+                            face_embedding = face.get("embedding")
+                            if face_embedding is None:
+                                face_img = img[y1:y2, x1:x2]
+                                if face_img.size > 0:
+                                    try:
+                                        face_embedding = self.system.extract_embedding(face_img)
+                                    except Exception as e:
+                                        print(f"Embedding extraction error: {e}")
+                                        face_embedding = None
+
+                            if face_embedding is not None:
+                                student_id, confidence = self.system.recognize_face(face_embedding)
+                            else:
+                                student_id, confidence = None, 0.0
+
+                            if student_id and confidence >= self.system.recognition_threshold:
+                                name = self.system.students[student_id]["name"]
+                                if student_id not in self.recognized_student_ids:
+                                    recognition_time = current_time - self.camera_start_time
+                                    # Console output mirrors main.py
+                                    print(f"{name:<40}{confidence*100:.2f}%{recognition_time:.2f} seconds")
+
+                                self.recognized_student_ids.add(student_id)
+                                self.system.log_attendance(student_id, name)
+                                self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
+                            elif student_id and 0.5 <= confidence < self.system.recognition_threshold:
+                                name = self.system.students[student_id]["name"]
+                                can_update = True
+                                if student_id in self.last_embedding_update:
+                                    if current_time - self.last_embedding_update[student_id] < self.system.min_embedding_update_interval:
+                                        can_update = False
+
+                                if can_update and face_embedding is not None:
+                                    if self.system.update_student_embedding(student_id, face_embedding, confidence):
+                                        self.notification_text = f"New appearance learned for {name}!"
+                                        self.notification_color = (0, 255, 0)
+                                        self.notification_end_time = current_time + 3
+                                        self.last_embedding_update[student_id] = current_time
+
+                                    if student_id not in self.recognized_student_ids:
+                                        print(f"{'AUTO-CONFIRMED:':<40}{confidence*100:.2f}%{current_time - self.camera_start_time:.2f} seconds")
+
+                                    self.recognized_student_ids.add(student_id)
+                                    self.system.log_attendance(student_id, name)
+
+                                self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
+                            else:
+                                # Show confidence even for unknown faces
+                                confidence_display = confidence if student_id else 0.0
+                                self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), "Unknown", confidence_display, False)
+                        except Exception as face_error:
+                            print(f"Face processing error: {face_error}")
+                            continue
+
+                    self.last_recognition_time = current_time
+                else:
+                    # Draw face boxes without recognition (for continuous tracking)
+                    for face in faces:
+                        try:
+                            bbox = face.get("bbox")
+                            if bbox is None:
+                                continue
+                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                            cv2.putText(img, "Tracking...", (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        except Exception as tracking_error:
+                            print(f"Tracking error: {tracking_error}")
+                            continue
+
+                # Draw statistics with better error handling
+                try:
+                    fps = self.frame_count / max(1e-6, (current_time - self.start_time))
+                    cv2.putText(img, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(img, f"Faces: {len(faces)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(img, f"Recognized: {len(self.recognized_student_ids)}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    cv2.putText(img, f"Threshold: {self.system.recognition_threshold:.2f}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(img, "Auto-Learning Active", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Add error count display for debugging
+                    if self.error_count > 0:
+                        cv2.putText(img, f"Errors: {self.error_count}/{self.max_errors}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                except Exception as stats_error:
+                    print(f"Stats drawing error: {stats_error}")
+
+                # Draw notification with error handling
+                try:
+                    if current_time < self.notification_end_time and self.notification_text:
+                        (text_width, text_height), _ = cv2.getTextSize(self.notification_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                        cv2.rectangle(
+                            img,
+                            (img.shape[1] // 2 - text_width // 2 - 10, img.shape[0] - 80),
+                            (img.shape[1] // 2 + text_width // 2 + 10, img.shape[0] - 40),
+                            (0, 0, 0),
+                            -1,
+                        )
+                        cv2.putText(
+                            img,
+                            self.notification_text,
+                            (img.shape[1] // 2 - text_width // 2, img.shape[0] - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            self.notification_color,
+                            2,
+                        )
+                except Exception as notification_error:
+                    print(f"Notification drawing error: {notification_error}")
+
+                # Store successful frame for fallback
+                result_frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+                self.last_successful_frame = result_frame
+                return result_frame
+                
+            except Exception as e:
+                self.error_count += 1
+                self.consecutive_errors += 1
+                print(f"Video processing error #{self.error_count}: {e}")
+                
+                # If too many consecutive errors, show error screen
+                if self.consecutive_errors >= self.max_errors:
+                    error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2 = __import__("cv2")
+                    cv2.putText(error_img, "Camera Error - Too Many Failures", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    cv2.putText(error_img, "Please refresh the page", (50, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(error_img, f"Errors: {self.error_count}", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    return av.VideoFrame.from_ndarray(error_img, format="bgr24")
+                else:
+                    # Return last successful frame or simple error frame
+                    if self.last_successful_frame is not None:
+                        return self.last_successful_frame
+                    else:
+                        error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2 = __import__("cv2")
+                    cv2.putText(error_img, f"Processing Error ({self.error_count}/{self.max_errors})", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    return av.VideoFrame.from_ndarray(error_img, format="bgr24")
 
     ctx = webrtc_streamer(
         key="attendance",
@@ -556,7 +834,28 @@ def admin_dashboard_page():
         return
 
     st.header("Admin Dashboard")
-    back_to_home_button("back-admin")
+    
+    # Logout button in top right
+    col_header, col_logout = st.columns([4, 1])
+    with col_header:
+        back_to_home_button("back-admin")
+    with col_logout:
+        if st.button("Logout", key="admin-logout", type="secondary", use_container_width=True):
+            st.session_state.is_admin_authenticated = False
+            st.success("Logged out successfully")
+            navigate("home")
+            st.rerun()
+
+    # Admin actions
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Delete Student", key="admin-nav-delete", use_container_width=True):
+            navigate("delete")
+            st.rerun()
+    with col_b:
+        if st.button("List Students", key="admin-nav-list", use_container_width=True):
+            navigate("list")
+            st.rerun()
 
     files = list_attendance_files()
     if not files:
@@ -564,7 +863,13 @@ def admin_dashboard_page():
         return
 
     for date_str, fp in files:
-        st.subheader(date_str)
+        # Display date in dd - mm - yyyy format without changing underlying filenames/keys
+        try:
+            dt_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            display_date = dt_obj.strftime("%d - %m - %Y")
+        except Exception:
+            display_date = date_str
+        st.subheader(display_date)
         records = read_attendance(fp)
         st.write(f"Total records: {len(records)}")
 

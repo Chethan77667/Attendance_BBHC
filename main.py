@@ -75,51 +75,80 @@ class DeepFaceAttendance:
             json.dump(self.embeddings, f, indent=2)
 
     def detect_faces(self, frame):
-        """Detect faces using InsightFace or OpenCV"""
+        """Detect faces using InsightFace or OpenCV with improved error handling"""
         faces = []
         
         # Try InsightFace first
         if self.face_analyzer:
             try:
                 insight_faces = self.face_analyzer.get(frame)
+                
                 for face in insight_faces:
-                    bbox = face.bbox.astype(int)
-                    faces.append({
-                        'bbox': bbox,
-                        'embedding': face.embedding,
-                        'confidence': face.det_score
-                    })
-            except:
-                pass
+                    try:
+                        bbox = face.bbox.astype(int)
+                        # Validate bbox dimensions
+                        if len(bbox) == 4 and all(coord >= 0 for coord in bbox):
+                            faces.append({
+                                'bbox': bbox,
+                                'embedding': face.embedding,
+                                'confidence': face.det_score
+                            })
+                    except Exception as face_error:
+                        print(f"Face processing error: {face_error}")
+                        continue
+                        
+            except Exception as e:
+                print(f"InsightFace detection error: {e}")
         
-        # Fallback to OpenCV
+        # Fallback to OpenCV if InsightFace fails or returns no faces
         if not faces:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            opencv_faces = self.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
-            
-            for (x, y, w, h) in opencv_faces:
-                faces.append({
-                    'bbox': [x, y, x+w, y+h],
-                    'embedding': None,
-                    'confidence': 0.8
-                })
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Optimize OpenCV detection parameters for better performance
+                opencv_faces = self.face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.1, 
+                    minNeighbors=4, 
+                    minSize=(60, 60),
+                    maxSize=(300, 300)  # Add max size to avoid very large detections
+                )
+                
+                for (x, y, w, h) in opencv_faces:
+                    # Validate face dimensions
+                    if w > 0 and h > 0 and x >= 0 and y >= 0:
+                        faces.append({
+                            'bbox': [x, y, x+w, y+h],
+                            'embedding': None,
+                            'confidence': 0.8
+                        })
+            except Exception as opencv_error:
+                print(f"OpenCV face detection error: {opencv_error}")
         
         return faces
 
     def extract_embedding(self, face_img):
-        """Extract embedding using InsightFace"""
+        """Extract embedding using InsightFace with improved error handling"""
         if not self.face_analyzer:
             return None
         
         try:
+            # Validate input image
+            if face_img is None or face_img.size == 0:
+                return None
+            
             # Resize for InsightFace
             face_resized = cv2.resize(face_img, (112, 112))
-            faces = self.face_analyzer.get(face_resized)
             
-            if faces and hasattr(faces[0], 'embedding'):
-                return faces[0].embedding
-        except:
-            pass
+            try:
+                faces = self.face_analyzer.get(face_resized)
+                
+                if faces and hasattr(faces[0], 'embedding'):
+                    return faces[0].embedding
+            except Exception as e:
+                print(f"Embedding extraction error: {e}")
+                
+        except Exception as e:
+            print(f"Face image processing error: {e}")
         
         return None
 
