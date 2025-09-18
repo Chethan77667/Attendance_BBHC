@@ -34,6 +34,38 @@ st.set_page_config(
 os.chdir(CURRENT_DIR)
 
 
+def inject_styles():
+    """Inject subtle animations and active-state styling for buttons."""
+    st.markdown(
+        """
+        <style>
+        /* Smooth animation for all buttons */
+        .stButton > button {
+            transition: transform 120ms ease, box-shadow 180ms ease, background-color 180ms ease;
+            will-change: transform;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 14px rgba(0,0,0,0.20);
+        }
+        .stButton > button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15) inset;
+        }
+        /* Primary button pulse to indicate active mode */
+        .stButton > button[kind="primary"] {
+            animation: pulseGlow 1.8s ease-in-out infinite;
+        }
+        @keyframes pulseGlow {
+            0% { box-shadow: 0 0 0 rgba(0, 148, 255, 0.0); }
+            50% { box-shadow: 0 0 0 6px rgba(0, 148, 255, 0.15); }
+            100% { box-shadow: 0 0 0 rgba(0, 148, 255, 0.0); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def ensure_backend():
     if "system" not in st.session_state:
         st.session_state.system = DeepFaceAttendance()
@@ -231,7 +263,7 @@ def log_check_event(student_id: str, name: str, mode: str) -> tuple[bool, str]:
     if mode == "checkin":
         if open_index is not None:
             # Already checked in; must checkout first
-            return False, "Already checked-in. Please check-out first."
+            return False, "Already checked in"
         # create new row
         records.append({
             "student_id": student_id,
@@ -240,13 +272,13 @@ def log_check_event(student_id: str, name: str, mode: str) -> tuple[bool, str]:
             "checkout": ""
         })
         _save_attendance_records(records)
-        return True, "Check-in successfully"
+        return True, "Check-in successfull"
     else:  # checkout
         if open_index is None:
-            return False, "No open check-in found."
+            return False, "Not in check-in mode"
         records[open_index]["checkout"] = now_iso
         _save_attendance_records(records)
-        return True, "Check-out successfully"
+        return True, "Check-out successfull"
 
 
 RTC_CONFIG = RTCConfiguration({
@@ -864,6 +896,33 @@ def attendance_page():
         video_processor_factory=AttendanceProcessor,
     )
 
+    # Inline mode controls placed right below the live video
+    controls_container = st.container()
+    with controls_container:
+        col_i1, col_i2, _ = st.columns([1, 1, 3])
+        with col_i1:
+            click_in = st.button(
+                "Check-In",
+                key="btn-checkin-inline",
+                type=("primary" if st.session_state.attendance_mode == "checkin" else "secondary"),
+                use_container_width=True,
+            )
+            if click_in and st.session_state.attendance_mode != "checkin":
+                st.session_state.attendance_mode = "checkin"
+                if ctx and ctx.video_processor:
+                    ctx.video_processor.mode = "checkin"
+        with col_i2:
+            click_out = st.button(
+                "Check-Out",
+                key="btn-checkout-inline",
+                type=("primary" if st.session_state.attendance_mode == "checkout" else "secondary"),
+                use_container_width=True,
+            )
+            if click_out and st.session_state.attendance_mode != "checkout":
+                st.session_state.attendance_mode = "checkout"
+                if ctx and ctx.video_processor:
+                    ctx.video_processor.mode = "checkout"
+
     recognized_box = st.empty()
     # Sync current mode to processor instance so overlay updates immediately
     if ctx.video_processor:
@@ -1083,6 +1142,7 @@ def router():
 if __name__ == "__main__":
     if "page" not in st.session_state:
         st.session_state.page = "home"
+    inject_styles()
     ensure_admin_credentials()
     render_sidebar()
     router()
