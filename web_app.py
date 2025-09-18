@@ -94,13 +94,20 @@ def create_tabular_bytes(records: list[dict]):
 
     - records: list of {student_id, name, timestamp}
     """
-    # Normalize order of keys for readability
+    # Normalize order of keys for readability. Support both legacy and new schema
     normalized = []
     for r in records:
+        checkin = r.get("checkin")
+        checkout = r.get("checkout")
+        timestamp = r.get("timestamp")
+        if (checkin is None and checkout is None) and timestamp is not None:
+            checkin = timestamp
+            checkout = ""
         normalized.append({
             "student_id": r.get("student_id", ""),
             "name": r.get("name", ""),
-            "timestamp": r.get("timestamp", ""),
+            "checkin": checkin or "",
+            "checkout": checkout or "",
         })
 
     try:
@@ -119,7 +126,7 @@ def create_tabular_bytes(records: list[dict]):
             buffer = BytesIO()
             # Write UTF-8 BOM so Excel opens it nicely
             buffer.write("\ufeff".encode("utf-8"))
-            fieldnames = ["student_id", "name", "timestamp"]
+            fieldnames = ["student_id", "name", "checkin", "checkout"]
             writer = csv.DictWriter(TextIOWrapper(buffer, encoding="utf-8", write_through=True), fieldnames=fieldnames)
             writer.writeheader()
             for row in normalized:
@@ -160,6 +167,86 @@ def read_attendance(fp: str) -> list[dict]:
 def clear_attendance(fp: str) -> None:
     with open(fp, "w", encoding="utf-8") as f:
         f.write("[]")
+
+
+# -------------------- Check-In / Check-Out helpers -------------------- #
+
+def _today_attendance_path() -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(_attendance_dir(), f"{today}.json")
+
+
+def _load_attendance_records() -> list[dict]:
+    fp = _today_attendance_path()
+    os.makedirs(_attendance_dir(), exist_ok=True)
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+    return []
+
+
+def _save_attendance_records(records: list[dict]) -> None:
+    fp = _today_attendance_path()
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def log_check_event(student_id: str, name: str, mode: str) -> tuple[bool, str]:
+    """Log a check-in or check-out event into today's attendance file.
+
+    - Keeps backward compatibility: if an old-style entry exists (with 'timestamp'),
+      it will be migrated into the new schema (checkin populated, checkout empty).
+    - New schema per record:
+      { student_id, name, checkin: iso or "", checkout: iso or "" }
+    """
+    mode = (mode or "checkin").lower()
+    now_iso = datetime.now().isoformat()
+    records = _load_attendance_records()
+
+    # Migrate any legacy rows
+    for r in records:
+        if "timestamp" in r and ("checkin" not in r and "checkout" not in r):
+            r["checkin"] = r.get("timestamp", "")
+            r["checkout"] = ""
+            r.pop("timestamp", None)
+        if "checkin" not in r:
+            r["checkin"] = ""
+        if "checkout" not in r:
+            r["checkout"] = ""
+
+    # Find open session (row with checkin set and checkout empty) for this student
+    open_index = None
+    for i in range(len(records) - 1, -1, -1):  # search from latest
+        r = records[i]
+        if r.get("student_id") == student_id:
+            if r.get("checkin") and not r.get("checkout"):
+                open_index = i
+                break
+
+    if mode == "checkin":
+        if open_index is not None:
+            # Already checked in; must checkout first
+            return False, "Already checked-in. Please check-out first."
+        # create new row
+        records.append({
+            "student_id": student_id,
+            "name": name,
+            "checkin": now_iso,
+            "checkout": ""
+        })
+        _save_attendance_records(records)
+        return True, "Check-in successfully"
+    else:  # checkout
+        if open_index is None:
+            return False, "No open check-in found."
+        records[open_index]["checkout"] = now_iso
+        _save_attendance_records(records)
+        return True, "Check-out successfully"
 
 
 RTC_CONFIG = RTCConfiguration({
@@ -500,6 +587,22 @@ def attendance_page():
     ensure_backend()
     system = st.session_state.system
 
+    # Select check mode (Check-In by default)
+    if "attendance_mode" not in st.session_state:
+        st.session_state.attendance_mode = "checkin"
+
+    col_m1, col_m2, col_m3 = st.columns([1, 1, 3])
+    with col_m1:
+        if st.button("Check-In", type=("primary" if st.session_state.attendance_mode == "checkin" else "secondary"), use_container_width=True, key="btn-checkin"):
+            st.session_state.attendance_mode = "checkin"
+            st.rerun()
+    with col_m2:
+        if st.button("Check-Out", type=("primary" if st.session_state.attendance_mode == "checkout" else "secondary"), use_container_width=True, key="btn-checkout"):
+            st.session_state.attendance_mode = "checkout"
+            st.rerun()
+
+    st.caption(f"Mode: {st.session_state.attendance_mode.title()}")
+
     # Display system status
     st.info(f"Camera running... Click Stop to end. Students registered: {len(system.students)}")
     
@@ -529,6 +632,7 @@ def attendance_page():
             self.last_successful_frame = None
             self.frame_skip_count = 0
             self.max_frame_skip = 3  # Skip processing every 3rd frame for better performance
+            self.mode = st.session_state.get("attendance_mode", "checkin")
 
         def recv(self, frame):
             try:
@@ -570,6 +674,8 @@ def attendance_page():
                 
                 # Reset consecutive errors on successful frame processing
                 self.consecutive_errors = 0
+                # Use mode provided by UI via outer thread (updated below)
+                current_mode = getattr(self, "mode", "checkin")
                 
                 # Face detection with error handling
                 faces = []
@@ -620,7 +726,11 @@ def attendance_page():
                                     print(f"{name:<40}{confidence*100:.2f}%{recognition_time:.2f} seconds")
 
                                 self.recognized_student_ids.add(student_id)
-                                self.system.log_attendance(student_id, name)
+                                # Log according to rules; show brief message if blocked
+                                success, msg = log_check_event(student_id, name, current_mode)
+                                self.notification_text = msg
+                                self.notification_color = (0, 255, 0) if success else (0, 0, 255)
+                                self.notification_end_time = current_time + 2
                                 self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
                             elif student_id and 0.5 <= confidence < self.system.recognition_threshold:
                                 name = self.system.students[student_id]["name"]
@@ -640,9 +750,20 @@ def attendance_page():
                                         print(f"{'AUTO-CONFIRMED:':<40}{confidence*100:.2f}%{current_time - self.camera_start_time:.2f} seconds")
 
                                     self.recognized_student_ids.add(student_id)
-                                    self.system.log_attendance(student_id, name)
+                                    success, msg = log_check_event(student_id, name, current_mode)
+                                    self.notification_text = msg
+                                    self.notification_color = (0, 255, 0) if success else (0, 0, 255)
+                                    self.notification_end_time = current_time + 2
 
                                 self.system.draw_face_box_with_name(img, (x1, y1, x2, y2), name, confidence, True)
+                                # If we didn't update due to cooldown, still log once for this mode
+                                if not can_update:
+                                    if student_id not in self.recognized_student_ids:
+                                        self.recognized_student_ids.add(student_id)
+                                    success, msg = log_check_event(student_id, name, current_mode)
+                                    self.notification_text = msg
+                                    self.notification_color = (0, 255, 0) if success else (0, 0, 255)
+                                    self.notification_end_time = current_time + 2
                             else:
                                 # Show confidence even for unknown faces
                                 confidence_display = confidence if student_id else 0.0
@@ -674,10 +795,13 @@ def attendance_page():
                     cv2.putText(img, f"Recognized: {len(self.recognized_student_ids)}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                     cv2.putText(img, f"Threshold: {self.system.recognition_threshold:.2f}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     cv2.putText(img, "Auto-Learning Active", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    # Show current mode on the video overlay
+                    mode_text = f"Mode: {'Check-Out' if current_mode == 'checkout' else 'Check-In'}"
+                    cv2.putText(img, mode_text, (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                 
                 # Add error count display for debugging
                     if self.error_count > 0:
-                        cv2.putText(img, f"Errors: {self.error_count}/{self.max_errors}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        cv2.putText(img, f"Errors: {self.error_count}/{self.max_errors}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 except Exception as stats_error:
                     print(f"Stats drawing error: {stats_error}")
 
@@ -741,7 +865,9 @@ def attendance_page():
     )
 
     recognized_box = st.empty()
+    # Sync current mode to processor instance so overlay updates immediately
     if ctx.video_processor:
+        ctx.video_processor.mode = st.session_state.get("attendance_mode", "checkin")
         ids = sorted(list(ctx.video_processor.recognized_student_ids))
         if ids:
             names = [system.students[i]["name"] for i in ids if i in system.students]
@@ -871,21 +997,39 @@ def admin_dashboard_page():
             display_date = date_str
         st.subheader(display_date)
         records = read_attendance(fp)
-        st.write(f"Total records: {len(records)}")
+        # Normalize for display (support legacy schema)
+        display_records = []
+        for r in records:
+            if "checkin" in r or "checkout" in r:
+                display_records.append(r)
+            elif "timestamp" in r:
+                display_records.append({
+                    "student_id": r.get("student_id", ""),
+                    "name": r.get("name", ""),
+                    "checkin": r.get("timestamp", ""),
+                    "checkout": ""
+                })
+            else:
+                display_records.append(r)
+        st.write(f"Total records: {len(display_records)}")
 
         if records:
             try:
                 import pandas as pd  # optional
-                df = pd.DataFrame(records)
+                df = pd.DataFrame(display_records)
+                # Order columns nicely if present
+                cols = [c for c in ["student_id", "name", "checkin", "checkout"] if c in df.columns]
+                if cols:
+                    df = df[cols]
                 st.dataframe(df, use_container_width=True)
             except Exception:
-                st.json(records)
+                st.json(display_records)
         else:
             st.info("No records for this date.")
 
         col1, col2 = st.columns(2)
         with col1:
-            data_bytes, mime, ext = create_tabular_bytes(records)
+            data_bytes, mime, ext = create_tabular_bytes(display_records)
             st.download_button(
                 label="Create Excel",
                 data=data_bytes,
